@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wise"
+version = "0.1.0"
+description = "WISE: World Knowledge-Informed Semantic Evaluation for text-to-image generation (WISE_Verified + legacy GPT-4o judge scripts)."
+readme = "README.md"
+requires-python = ">=3.12"
+keywords = ["text-to-image", "evaluation", "benchmark", "world-knowledge"]
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.optional-dependencies]
+# Original GPT-4o-based judge in WISE_legacy/ uses the deprecated `openai` 0.x API.
+legacy = ["openai>=0.28.1,<1"]
+
+[project.urls]
+Paper = "https://arxiv.org/abs/2503.07265"
+
+[tool.setuptools]
+# Avoid auto-discovery of `WISE_legacy` and `data_verified` as installable packages.
+py-modules = ["main", "calculate_verified", "vllm_eval"]
