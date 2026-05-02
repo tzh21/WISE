@@ -6,6 +6,10 @@ Generate all WISE_Verified benchmark images with Emu3-Gen.
 Outputs `{prompt_id}.png` (1–1000) into the chosen directory so you can run
 `eval_qwen.sh` with IMAGE_DIR pointing at that folder.
 
+Use ``--gpus`` to run one model copy per GPU (multiprocessing, ``spawn``). Example::
+
+    uv run python .../generate_emu3_wise.py --gpus 0 1 2 3
+
 Run from an environment that has Emu3 dependencies installed (same as Emu3's
 image_generation.py), for example::
 
@@ -19,9 +23,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 
 def _default_emu3_repo() -> Path:
@@ -59,7 +66,14 @@ def parse_args() -> argparse.Namespace:
         default=Path(os.environ.get("EMU3_REPO", str(_default_emu3_repo()))),
         help="Root of the Emu3 repo (for importing emu3.*)",
     )
-    p.add_argument("--device", default="cuda:0", help="Torch device for generation")
+    p.add_argument(
+        "--gpus",
+        type=int,
+        nargs="+",
+        default=[0],
+        metavar="N",
+        help="GPU indices; one full model per GPU via separate processes (default: 0)",
+    )
     p.add_argument(
         "--ratio",
         default="1:1",
@@ -102,11 +116,36 @@ def load_prompts(path: Path) -> dict[int, str]:
     return out
 
 
-def main() -> None:
-    args = parse_args()
-    emu3_repo = args.emu3_repo.resolve()
-    if str(emu3_repo) not in sys.path:
-        sys.path.insert(0, str(emu3_repo))
+def _split_round_robin(ids: list[int], n: int) -> list[list[int]]:
+    buckets: list[list[int]] = [[] for _ in range(n)]
+    for i, pid in enumerate(ids):
+        buckets[i % n].append(pid)
+    return buckets
+
+
+def _worker_put_results(
+    gpu_id: int,
+    prompt_ids: list[int],
+    prompts: dict[int, str],
+    cfg: dict[str, Any],
+    result_queue: mp.Queue,
+) -> None:
+    for item in _generate_shard(gpu_id, prompt_ids, prompts, cfg):
+        result_queue.put(item)
+
+
+def _generate_shard(
+    gpu_id: int,
+    prompt_ids: list[int],
+    prompts: dict[int, str],
+    cfg: dict[str, Any],
+) -> Iterator[tuple[int, str | None]]:
+    """Yield ``(prompt_id, error)`` per image; ``error`` is None on success."""
+    if not prompt_ids:
+        return
+    emu3_repo = Path(cfg["emu3_repo"])
+    if str(emu3_repo.resolve()) not in sys.path:
+        sys.path.insert(0, str(emu3_repo.resolve()))
 
     import torch
     from PIL import Image
@@ -120,41 +159,27 @@ def main() -> None:
 
     from emu3.mllm.processing_emu3 import Emu3Processor
 
-    try:
-        from tqdm import tqdm
-    except ImportError as e:
-        raise SystemExit(
-            "Please install tqdm (e.g. `pip install tqdm` or use WISE's uv env)."
-        ) from e
+    device = f"cuda:{gpu_id}"
+    emu_hub = cfg["emu_hub"]
+    vq_hub = cfg["vq_hub"]
+    ratio = cfg["ratio"]
+    cfg_scale = cfg["classifier_free_guidance"]
+    attn_impl = cfg["attn_implementation"]
+    out_dir = Path(cfg["output_dir"])
 
-    merge_path = args.merge_json.resolve()
-    if not merge_path.is_file():
-        raise SystemExit(f"Missing prompts file: {merge_path}")
-
-    out_dir = args.output_dir.resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    prompts = load_prompts(merge_path)
-    ids_sorted = sorted(prompts.keys())
-    expected = set(range(1, 1001))
-    missing_ids = expected - set(prompts.keys())
-    if missing_ids:
-        print(f"[WARN] merge.json missing prompt_ids: {sorted(missing_ids)[:20]}… ({len(missing_ids)} total)")
-
-    print(f"[INFO] Loading Emu3-Gen from {args.emu_hub}")
     model = AutoModelForCausalLM.from_pretrained(
-        args.emu_hub,
-        device_map=args.device,
+        emu_hub,
+        device_map=device,
         torch_dtype=torch.bfloat16,
-        attn_implementation=args.attn_implementation,
+        attn_implementation=attn_impl,
         trust_remote_code=True,
     )
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.emu_hub, trust_remote_code=True, padding_side="left")
-    image_processor = AutoImageProcessor.from_pretrained(args.vq_hub, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(emu_hub, trust_remote_code=True, padding_side="left")
+    image_processor = AutoImageProcessor.from_pretrained(vq_hub, trust_remote_code=True)
     image_tokenizer = AutoModel.from_pretrained(
-        args.vq_hub, device_map=args.device, trust_remote_code=True
+        vq_hub, device_map=device, trust_remote_code=True
     ).eval()
     processor = Emu3Processor(image_processor, image_tokenizer, tokenizer)
 
@@ -167,14 +192,11 @@ def main() -> None:
         top_k=2048,
     )
 
-    device = args.device
-    cfg_scale = args.classifier_free_guidance
-
     def generate_one(prompt_text: str) -> Image.Image | None:
         full_prompt = prompt_text + POSITIVE_PROMPT
         kwargs = dict(
             mode="G",
-            ratio=args.ratio,
+            ratio=ratio,
             image_area=model.config.image_area,
             return_tensors="pt",
             padding="longest",
@@ -208,6 +230,48 @@ def main() -> None:
                 return im
         return None
 
+    for pid in prompt_ids:
+        out_png = out_dir / f"{pid}.png"
+        try:
+            pil = generate_one(prompts[pid])
+            if pil is None:
+                yield pid, "decode produced no PIL image"
+            else:
+                pil.save(out_png)
+                yield pid, None
+        except Exception as e:
+            yield pid, str(e)
+
+
+def main() -> None:
+    args = parse_args()
+    gpu_ids = list(args.gpus)
+    if len(gpu_ids) < 1:
+        raise SystemExit("At least one GPU index is required (--gpus).")
+    if any(g < 0 for g in gpu_ids):
+        raise SystemExit("GPU indices must be non-negative.")
+
+    try:
+        from tqdm import tqdm
+    except ImportError as e:
+        raise SystemExit(
+            "Please install tqdm (e.g. `pip install tqdm` or use WISE's uv env)."
+        ) from e
+
+    merge_path = args.merge_json.resolve()
+    if not merge_path.is_file():
+        raise SystemExit(f"Missing prompts file: {merge_path}")
+
+    out_dir = args.output_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    prompts = load_prompts(merge_path)
+    ids_sorted = sorted(prompts.keys())
+    expected = set(range(1, 1001))
+    missing_ids = expected - set(prompts.keys())
+    if missing_ids:
+        print(f"[WARN] merge.json missing prompt_ids: {sorted(missing_ids)[:20]}… ({len(missing_ids)} total)")
+
     to_run: list[int] = []
     for pid in ids_sorted:
         out_png = out_dir / f"{pid}.png"
@@ -216,21 +280,65 @@ def main() -> None:
         to_run.append(pid)
 
     print(f"[INFO] Saving images under {out_dir}")
-    print(f"[INFO] Total prompts: {len(ids_sorted)}, to generate: {len(to_run)}, skip_existing={args.skip_existing}")
+    print(
+        f"[INFO] Total prompts: {len(ids_sorted)}, to generate: {len(to_run)}, "
+        f"gpus={gpu_ids}, skip_existing={args.skip_existing}"
+    )
+    if not to_run:
+        print("[DONE] Nothing to generate.")
+        return
+
+    emu3_repo = args.emu3_repo.resolve()
+    cfg: dict[str, Any] = {
+        "emu_hub": str(args.emu_hub),
+        "vq_hub": str(args.vq_hub),
+        "emu3_repo": str(emu3_repo),
+        "output_dir": str(out_dir),
+        "ratio": args.ratio,
+        "classifier_free_guidance": float(args.classifier_free_guidance),
+        "attn_implementation": args.attn_implementation,
+    }
+
+    n_workers = len(gpu_ids)
+    shards = _split_round_robin(to_run, n_workers)
+    for gid, shard in zip(gpu_ids, shards):
+        print(f"[INFO] GPU {gid}: {len(shard)} image(s) in this process")
 
     failures: list[int] = []
-    for pid in tqdm(to_run, desc="Emu3-Gen WISE", unit="img"):
-        out_png = out_dir / f"{pid}.png"
-        try:
-            pil = generate_one(prompts[pid])
-            if pil is None:
-                failures.append(pid)
-                tqdm.write(f"[ERR] prompt_id={pid}: decode produced no PIL image")
+
+    if n_workers == 1:
+        with tqdm(total=len(to_run), desc="Emu3-Gen WISE", unit="img") as pbar:
+            for pid, err in _generate_shard(gpu_ids[0], shards[0], prompts, cfg):
+                pbar.update(1)
+                if err is not None:
+                    failures.append(pid)
+                    tqdm.write(f"[ERR] prompt_id={pid}: {err}")
+    else:
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        processes: list[mp.Process] = []
+        for gid, shard in zip(gpu_ids, shards):
+            if not shard:
                 continue
-            pil.save(out_png)
-        except Exception as e:
-            failures.append(pid)
-            tqdm.write(f"[ERR] prompt_id={pid}: {e}")
+            proc = ctx.Process(
+                target=_worker_put_results,
+                args=(gid, shard, prompts, cfg, result_queue),
+            )
+            proc.start()
+            processes.append(proc)
+
+        with tqdm(total=len(to_run), desc="Emu3-Gen WISE", unit="img") as pbar:
+            for _ in range(len(to_run)):
+                pid, err = result_queue.get()
+                pbar.update(1)
+                if err is not None:
+                    failures.append(pid)
+                    tqdm.write(f"[ERR] prompt_id={pid}: {err}")
+
+        for proc in processes:
+            proc.join()
+            if proc.exitcode != 0:
+                print(f"[WARN] Worker pid={proc.pid} exited with code {proc.exitcode}")
 
     if failures:
         print(f"[WARN] Failed count={len(failures)}; ids (first 50): {failures[:50]}")
