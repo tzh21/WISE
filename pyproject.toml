@@ -10,8 +10,11 @@ readme = "README.md"
 requires-python = ">=3.12"
 keywords = ["text-to-image", "evaluation", "benchmark", "world-knowledge"]
 dependencies = [
+    "diffusers>=0.37.1",
     "requests>=2.28.0",
+    "torch>=2.11.0",
     "tqdm>=4.66.0",
+    "transformers>=5.7.0",
 ]
 
 [project.optional-dependencies]
