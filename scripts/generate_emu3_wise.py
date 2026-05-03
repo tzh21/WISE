@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Generate all WISE_Verified benchmark images with Emu3-Gen.
+Generate all WISE_Verified benchmark images with Emu3 Gen or Stage1 (text-to-image).
 
 Outputs `{prompt_id}.png` (1–1000) into the chosen directory so you can run
 `eval_qwen.sh` with IMAGE_DIR pointing at that folder.
 
+Use ``--emu-variant`` to switch checkpoints and processor formatting (Gen vs Stage1).
+Default hub paths: ``/share/project/tzh/models/Emu3-Gen`` and
+``/share/project/tzh/models/Emu3-Stage1`` (override with ``--emu-hub`` or
+``EMU_GEN_HUB`` / ``EMU_STAGE1_HUB``; legacy ``EMU_HUB`` still applies when
+variant is ``gen``).
+
+Default output directory includes the variant suffix (``.../generated_images/emu3_gen``
+or ``.../emu3_stage1``) so the two evaluations do not clobber each other.
+
 Use ``--gpus`` to run one model copy per GPU (multiprocessing, ``spawn``). Example::
 
     uv run python .../generate_emu3_wise.py --gpus 0 1 2 3
+    uv run python .../generate_emu3_wise.py --emu-variant stage1 --gpus 0
 
 Run from an environment that has Emu3 dependencies installed (same as Emu3's
 image_generation.py), for example::
@@ -30,18 +40,55 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+_WISE_ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_GEN_HUB = "/share/project/tzh/models/Emu3-Gen"
+_DEFAULT_STAGE1_HUB = "/share/project/tzh/models/Emu3-Stage1"
+
 
 def _default_emu3_repo() -> Path:
-    wise_root = Path(__file__).resolve().parents[1]
-    return wise_root.parent / "Emu3"
+    return _WISE_ROOT.parent / "Emu3"
+
+
+def _default_emu_hub_for_variant(variant: str) -> str:
+    """Resolve default causal-LM checkpoint for ``gen`` or ``stage1``."""
+    if variant == "gen":
+        return os.environ.get("EMU_GEN_HUB", os.environ.get("EMU_HUB", _DEFAULT_GEN_HUB))
+    return os.environ.get("EMU_STAGE1_HUB", _DEFAULT_STAGE1_HUB)
+
+
+def resolve_emu_hub(variant: str, explicit: str | None) -> str:
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return _default_emu_hub_for_variant(variant)
+
+
+def resolve_output_dir(variant: str, explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    return _WISE_ROOT / "local" / "generated_images" / f"emu3_{variant}"
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate WISE images with Emu3-Gen")
+    p = argparse.ArgumentParser(
+        description="Generate WISE images with Emu3 Gen or Stage1 (text-to-image)"
+    )
+    p.add_argument(
+        "--emu-variant",
+        choices=["gen", "stage1"],
+        default="gen",
+        help=(
+            "Model family: default hub, processor/chat_template, and default output-dir "
+            "subdir (unless overridden)"
+        ),
+    )
     p.add_argument(
         "--emu-hub",
-        default=os.environ.get("EMU_HUB", "/share/project/tzh/models/Emu3-Gen"),
-        help="Emu3-Gen HF/local checkpoint path",
+        default=None,
+        help=(
+            "HF/local causal LM path (overrides variant default). Env: EMU_GEN_HUB for "
+            "gen, EMU_STAGE1_HUB for stage1; legacy EMU_HUB is used only for gen when "
+            "EMU_GEN_HUB is unset."
+        ),
     )
     p.add_argument(
         "--vq-hub",
@@ -57,8 +104,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/share/project/tzh/WISE/local/generated_images/emu3"),
-        help="Directory for 1.png … 1000.png",
+        default=None,
+        help=(
+            "Directory for 1.png … 1000.png. Default: WISE/local/generated_images/"
+            "emu3_<variant> (e.g. emu3_gen)"
+        ),
     )
     p.add_argument(
         "--emu3-repo",
@@ -181,7 +231,16 @@ def _generate_shard(
     image_tokenizer = AutoModel.from_pretrained(
         vq_hub, device_map=device, trust_remote_code=True
     ).eval()
-    processor = Emu3Processor(image_processor, image_tokenizer, tokenizer)
+    variant = cfg["emu_variant"]
+    if variant == "stage1":
+        processor = Emu3Processor(
+            image_processor,
+            image_tokenizer,
+            tokenizer,
+            chat_template="{image_prompt}{text_prompt}",
+        )
+    else:
+        processor = Emu3Processor(image_processor, image_tokenizer, tokenizer)
 
     generation_config = GenerationConfig(
         use_cache=True,
@@ -245,6 +304,8 @@ def _generate_shard(
 
 def main() -> None:
     args = parse_args()
+    emu_hub = resolve_emu_hub(args.emu_variant, args.emu_hub)
+    out_dir = resolve_output_dir(args.emu_variant, args.output_dir)
     gpu_ids = list(args.gpus)
     if len(gpu_ids) < 1:
         raise SystemExit("At least one GPU index is required (--gpus).")
@@ -262,7 +323,7 @@ def main() -> None:
     if not merge_path.is_file():
         raise SystemExit(f"Missing prompts file: {merge_path}")
 
-    out_dir = args.output_dir.resolve()
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     prompts = load_prompts(merge_path)
@@ -279,6 +340,7 @@ def main() -> None:
             continue
         to_run.append(pid)
 
+    print(f"[INFO] emu_variant={args.emu_variant}, emu_hub={emu_hub}")
     print(f"[INFO] Saving images under {out_dir}")
     print(
         f"[INFO] Total prompts: {len(ids_sorted)}, to generate: {len(to_run)}, "
@@ -290,7 +352,8 @@ def main() -> None:
 
     emu3_repo = args.emu3_repo.resolve()
     cfg: dict[str, Any] = {
-        "emu_hub": str(args.emu_hub),
+        "emu_variant": args.emu_variant,
+        "emu_hub": str(emu_hub),
         "vq_hub": str(args.vq_hub),
         "emu3_repo": str(emu3_repo),
         "output_dir": str(out_dir),
@@ -306,8 +369,9 @@ def main() -> None:
 
     failures: list[int] = []
 
+    bar_desc = f"Emu3-{args.emu_variant} WISE"
     if n_workers == 1:
-        with tqdm(total=len(to_run), desc="Emu3-Gen WISE", unit="img") as pbar:
+        with tqdm(total=len(to_run), desc=bar_desc, unit="img") as pbar:
             for pid, err in _generate_shard(gpu_ids[0], shards[0], prompts, cfg):
                 pbar.update(1)
                 if err is not None:
@@ -327,7 +391,7 @@ def main() -> None:
             proc.start()
             processes.append(proc)
 
-        with tqdm(total=len(to_run), desc="Emu3-Gen WISE", unit="img") as pbar:
+        with tqdm(total=len(to_run), desc=bar_desc, unit="img") as pbar:
             for _ in range(len(to_run)):
                 pid, err = result_queue.get()
                 pbar.update(1)
