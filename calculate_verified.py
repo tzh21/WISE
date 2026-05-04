@@ -11,6 +11,9 @@ def calculate_wiscore(score):
     """
     return float(score)
 
+# Written alongside *_scores_results.json / *_full_results.json (first input path's directory).
+SUMMARY_JSON_FILENAME = "evaluation_summary.json"
+
 # Define expected prompt ID ranges at a global level for easy access
 EXPECTED_PROMPT_RANGES = {
     "culture": range(1, 401),
@@ -102,6 +105,17 @@ def process_jsonl_file_segment(file_path, category_arg=None):
         'file_path': file_path
     }
 
+
+def write_summary_json(path: str, payload: dict) -> None:
+    out = os.path.abspath(path)
+    parent = os.path.dirname(out)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"[SAVE] summary written to {out}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate JSONL files for model performance, categorizing scores by prompt_id."
@@ -119,7 +133,7 @@ def main():
         default='all',
         help="Specify the category of the JSONL file(s) for specific prompt_id validation. Choose from 'culture', 'space-time', 'science', or 'all' (default). If evaluating a single category file, use the corresponding category."
     )
-    
+
     args = parser.parse_args()
     
     all_raw_results = []
@@ -234,7 +248,10 @@ def main():
 
     # Calculate and print Overall WiScore if '--category all' was specified and all categories have samples
     all_categories_have_overall_samples = all(overall_num_samples.get(cat, 0) > 0 for cat in ordered_categories)
-    
+
+    overall_wiscore = None
+    overall_wiscore_components = None
+
     if args.category == 'all' and all_categories_have_overall_samples:
         cultural_score = overall_avg_scores.get('CULTURE', 0)
         time_score = overall_avg_scores.get('TIME', 0)
@@ -245,7 +262,15 @@ def main():
 
         overall_wiscore = (0.4 * cultural_score + 0.12 * time_score + 0.12 * space_score +
                            0.12 * biology_score + 0.12 * physics_score + 0.12 * chemistry_score)
-        
+        overall_wiscore_components = {
+            "CULTURE": cultural_score,
+            "TIME": time_score,
+            "SPACE": space_score,
+            "BIOLOGY": biology_score,
+            "PHYSICS": physics_score,
+            "CHEMISTRY": chemistry_score,
+        }
+
         print("\n--- Overall WiScore Across All Categories ---")
         print(f"Overall WiScore: {overall_wiscore:.2f}")
         print("Cultural\tTime\tSpace\tBiology\tPhysics\tChemistry\tOverall")
@@ -254,6 +279,38 @@ def main():
         print("\nOverall WiScore cannot be calculated: Not all categories have samples in the aggregated data when '--category all' is specified.")
     else:
         print(f"\nOverall WiScore calculation skipped. To calculate overall score, use '--category all' and provide files covering all prompt IDs.")
+
+    summary_dir = os.path.dirname(os.path.abspath(args.files[0]))
+    summary_path = os.path.join(summary_dir, SUMMARY_JSON_FILENAME)
+    summary_payload = {
+        "category": args.category,
+        "score_files": list(args.files),
+        "individual_files": {
+            fp: {
+                "average_binary_wiscore_by_category": {k: float(v) for k, v in data["average"].items()},
+                "num_samples_by_category": dict(data["num_processed_samples"]),
+                "detected_categories": list(data["detected_categories"]),
+            }
+            for fp, data in final_file_reports.items()
+        },
+        "aggregated": {
+            "average_binary_wiscore_by_category": {k: float(v) for k, v in overall_avg_scores.items()},
+            "num_samples_by_category": {k: int(v) for k, v in overall_num_samples.items()},
+            "all_categories_have_samples": all_categories_have_overall_samples,
+            "overall_wiscore": float(overall_wiscore) if overall_wiscore is not None else None,
+            "overall_wiscore_components": (
+                {k: float(v) for k, v in overall_wiscore_components.items()}
+                if overall_wiscore_components is not None
+                else None
+            ),
+            "overall_wiscore_formula": (
+                "0.4*CULTURE + 0.12*(TIME + SPACE + BIOLOGY + PHYSICS + CHEMISTRY)"
+                if args.category == "all"
+                else None
+            ),
+        },
+    }
+    write_summary_json(summary_path, summary_payload)
 
 
 if __name__ == "__main__":
