@@ -18,12 +18,20 @@ other — mirroring ``generate_emu3_wise.py`` pattern.
   swaps in the base weights and applies upstream-recommended T2I defaults (visual CFG 2,
   broader ``image_top_k``, larger ``image_area`` / token budget as in ``configs/config.py``).
 
-Both share the same inference pipeline as ``Emu3.5/inference.py`` (one image per GPU
-forward). Use ``--gpus`` with multiprocessing ``spawn``. Example::
+Both share the same inference pipeline as ``Emu3.5/inference.py``. ``--gpus`` lists the
+**first physical GPU index** of each worker; each worker owns ``--gpu-per-worker``
+**consecutive** GPUs (default 1 = one full model per worker on that GPU). With
+``--gpu-per-worker`` > 1 the causal LM uses HuggingFace ``device_map="auto"`` across
+that worker's visible devices. Use multiprocessing ``spawn`` whenever there is more than
+one worker or more than one GPU per worker. Examples::
 
     cd /share/project/tzh/Emu3.5
+    # Four workers, one GPU each: bases 0,1,2,3
     uv run python .../generate_emu3.5_wise.py --emu-variant image --gpus 0 1 2 3
-    uv run python .../generate_emu3.5_wise.py --emu-variant base --gpus 0
+    # One worker using physical GPU 0 and 1 for a single sharded model
+    uv run python .../generate_emu3.5_wise.py --emu-variant base --gpus 0 --gpu-per-worker 2
+    # Two workers: GPUs 0-1 and 2-3
+    uv run python .../generate_emu3.5_wise.py --emu-variant image --gpus 0 2 --gpu-per-worker 2
 
 Or set ``EMU35_REPO`` if the Emu3.5 tree lives elsewhere. Override weights with
 ``--model-path``, VQ with ``--vq-path`` / ``EMU35_VQ_HUB``.
@@ -146,7 +154,20 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=[0],
         metavar="N",
-        help="GPU indices; one full model per GPU in separate processes (default: 0)",
+        help=(
+            "Per worker: index of the first physical GPU in a consecutive block of length "
+            "--gpu-per-worker (default block length 1)"
+        ),
+    )
+    p.add_argument(
+        "--gpu-per-worker",
+        type=int,
+        default=1,
+        metavar="K",
+        help=(
+            "Each worker uses K consecutive GPUs: first index is from --gpus, block is "
+            "base..base+K-1. K>1 loads the causal LM with device_map=auto on those GPUs."
+        ),
     )
     p.add_argument(
         "--aspect-ratio",
@@ -217,14 +238,36 @@ def _split_round_robin(ids: list[int], n: int) -> list[list[int]]:
     return buckets
 
 
+def _validate_worker_gpu_layout(
+    worker_bases: list[int], gpu_per_worker: int, n_cuda: int
+) -> None:
+    if gpu_per_worker < 1:
+        raise SystemExit("--gpu-per-worker must be >= 1.")
+    seen: set[int] = set()
+    for base in worker_bases:
+        if base < 0:
+            raise SystemExit("GPU indices in --gpus must be non-negative.")
+        if base + gpu_per_worker > n_cuda:
+            raise SystemExit(
+                f"Worker starting at GPU {base} requires devices "
+                f"{base}..{base + gpu_per_worker - 1}, but only {n_cuda} CUDA device(s) exist."
+            )
+        for g in range(base, base + gpu_per_worker):
+            if g in seen:
+                raise SystemExit(
+                    f"Overlapping GPU assignment: device {g} is used by more than one worker."
+                )
+            seen.add(g)
+
+
 def _worker_put_results(
-    gpu_id: int,
+    gpu_base: int,
     prompt_ids: list[int],
     prompts: dict[int, str],
     cfg: dict[str, Any],
     result_queue: mp.Queue,
 ) -> None:
-    for item in _generate_shard(gpu_id, prompt_ids, prompts, cfg):
+    for item in _generate_shard(gpu_base, prompt_ids, prompts, cfg):
         result_queue.put(item)
 
 
@@ -272,7 +315,7 @@ def _apply_variant_hparams(cfg_mod: ModuleType, variant: str) -> None:
 
 
 def _generate_shard(
-    gpu_id: int,
+    gpu_base: int,
     prompt_ids: list[int],
     prompts: dict[int, str],
     run_cfg: dict[str, Any],
@@ -280,6 +323,12 @@ def _generate_shard(
     """Yield ``(prompt_id, error)`` per image; ``error`` is None on success."""
     if not prompt_ids:
         return
+
+    gpu_per_worker = int(run_cfg.get("gpu_per_worker", 1))
+    if gpu_per_worker > 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(gpu_base + i) for i in range(gpu_per_worker)
+        )
 
     import torch
     from PIL import Image
@@ -318,15 +367,22 @@ def _generate_shard(
 
     cfg_mod.streaming = False
 
-    torch.cuda.set_device(gpu_id)
+    if gpu_per_worker > 1:
+        torch.cuda.set_device(0)
+        model_device: int | str = "auto"
+        vq_device = "cuda:0"
+    else:
+        torch.cuda.set_device(gpu_base)
+        model_device = gpu_base
+        vq_device = f"cuda:{gpu_base}"
 
     model, tokenizer, vq_model = build_emu3p5(
         model_path,
         tokenizer_path,
         vq_path,
         vq_type=vq_type,
-        model_device=gpu_id,
-        vq_device=f"cuda:{gpu_id}",
+        model_device=model_device,
+        vq_device=vq_device,
         **getattr(cfg_mod, "diffusion_decoder_kwargs", {}),
     )
 
@@ -413,11 +469,10 @@ def main() -> None:
     resolved_model = resolve_model_hub(variant, args.model_path)
     vq_override = resolve_vq_hub(args.vq_path)
     out_dir = resolve_output_dir(variant, args.output_dir)
-    gpu_ids = list(args.gpus)
-    if len(gpu_ids) < 1:
+    worker_gpu_bases = list(args.gpus)
+    gpu_per_worker = int(args.gpu_per_worker)
+    if len(worker_gpu_bases) < 1:
         raise SystemExit("At least one GPU index is required (--gpus).")
-    if any(g < 0 for g in gpu_ids):
-        raise SystemExit("GPU indices must be non-negative.")
 
     try:
         from tqdm import tqdm
@@ -430,6 +485,10 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for Emu3.5 generation.")
+
+    _validate_worker_gpu_layout(
+        worker_gpu_bases, gpu_per_worker, torch.cuda.device_count()
+    )
 
     merge_path = args.merge_json.resolve()
     if not merge_path.is_file():
@@ -473,8 +532,8 @@ def main() -> None:
     print(f"[INFO] Saving images under {out_dir}")
     print(
         f"[INFO] Total prompts: {len(ids_sorted)}, to generate: {len(to_run)}, "
-        f"gpus={gpu_ids}, aspect_ratio={args.aspect_ratio}, "
-        f"skip_existing={args.skip_existing}"
+        f"worker_gpu_bases={worker_gpu_bases}, gpu_per_worker={gpu_per_worker}, "
+        f"aspect_ratio={args.aspect_ratio}, skip_existing={args.skip_existing}"
     )
     if not to_run:
         print("[DONE] Nothing to generate.")
@@ -491,19 +550,29 @@ def main() -> None:
         "aspect_ratio": args.aspect_ratio,
         "classifier_free_guidance": args.classifier_free_guidance,
         "seed_base": args.seed_base,
+        "gpu_per_worker": gpu_per_worker,
     }
 
-    n_workers = len(gpu_ids)
+    n_workers = len(worker_gpu_bases)
     shards = _split_round_robin(to_run, n_workers)
-    for gid, shard in zip(gpu_ids, shards):
-        print(f"[INFO] GPU {gid}: {len(shard)} image(s) in this process")
+    for base, shard in zip(worker_gpu_bases, shards):
+        if gpu_per_worker > 1:
+            dev_rng = f"{base}..{base + gpu_per_worker - 1}"
+        else:
+            dev_rng = str(base)
+        print(f"[INFO] worker base GPU {base} (devices {dev_rng}): {len(shard)} image(s)")
 
     failures: list[int] = []
     bar_desc = "Emu3.5-Image WISE" if variant == "image" else "Emu3.5 WISE"
 
-    if n_workers == 1:
+    # Child processes must set CUDA_VISIBLE_DEVICES before CUDA init when gpu_per_worker>1.
+    use_spawn = n_workers > 1 or gpu_per_worker > 1
+
+    if not use_spawn:
         with tqdm(total=len(to_run), desc=bar_desc, unit="img") as pbar:
-            for pid, err in _generate_shard(gpu_ids[0], shards[0], prompts_map, cfg):
+            for pid, err in _generate_shard(
+                worker_gpu_bases[0], shards[0], prompts_map, cfg
+            ):
                 pbar.update(1)
                 if err is not None:
                     failures.append(pid)
@@ -512,12 +581,12 @@ def main() -> None:
         ctx = mp.get_context("spawn")
         result_queue = ctx.Queue()
         processes: list[mp.Process] = []
-        for gid, shard in zip(gpu_ids, shards):
+        for base, shard in zip(worker_gpu_bases, shards):
             if not shard:
                 continue
             proc = ctx.Process(
                 target=_worker_put_results,
-                args=(gid, shard, prompts_map, cfg, result_queue),
+                args=(base, shard, prompts_map, cfg, result_queue),
             )
             proc.start()
             processes.append(proc)
