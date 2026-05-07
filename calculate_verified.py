@@ -25,8 +25,9 @@ EXPECTED_PROMPT_RANGES = {
 def process_jsonl_file_segment(file_path, category_arg=None):
     """
     Processes a segment of a JSONL file, collecting scores and present prompt_ids.
-    Performs prompt_id validation if a specific category_arg is provided for a single file.
-    Returns collected data or None if critical errors or missing prompt_ids (for single-file validation).
+    Performs prompt_id validation if a specific category_arg is provided for a single file
+    (missing expected ids emit a warning but still return partial results).
+    Returns collected data or None on critical errors (e.g. missing file, unreadable file).
     """
     segment_scores = defaultdict(list)
     segment_present_prompt_ids = set()
@@ -95,10 +96,12 @@ def process_jsonl_file_segment(file_path, category_arg=None):
         missing_ids_in_segment = expected_ids_for_this_category - segment_present_prompt_ids
 
         if missing_ids_in_segment:
-            print(f"Error: File '{file_path}': When evaluating as '--category {category_arg}', "
-                  f"missing the following prompt_ids: {sorted(list(missing_ids_in_segment))}")
-            return None # Return None if required prompt_ids are missing for a specific category file
-    
+            print(
+                f"Warning: File '{file_path}': When evaluating as '--category {category_arg}', "
+                f"missing the following prompt_ids (continuing with partial results): "
+                f"{sorted(list(missing_ids_in_segment))}"
+            )
+
     return {
         'scores': segment_scores,
         'present_prompt_ids': segment_present_prompt_ids,
@@ -181,18 +184,18 @@ def main():
             'detected_categories': detected_categories_in_file
         }
 
-    # --- Step 1: Validate Prompt IDs for 'all' category scenario ---
-    # This check happens only when --category all is explicitly chosen or is the default for multiple files.
-    # Single-file specific category validation happens inside process_jsonl_file_segment.
-    if args.category == 'all':
-        expected_prompt_ids_for_all = set(EXPECTED_PROMPT_RANGES['all'])
-        missing_prompt_ids_in_combined = expected_prompt_ids_for_all - combined_present_prompt_ids
-
-        if missing_prompt_ids_in_combined:
-            print(f"\nError: When '--category all' is specified, the combined files are missing the following prompt_ids:")
-            print(f"Missing IDs: {sorted(list(missing_prompt_ids_in_combined))}")
-            print("\nAborting overall evaluation due to incomplete data.")
-            return # Exit if combined prompt IDs are missing when 'all' is expected
+    missing_prompt_ids_report = []
+    if args.category == "all":
+        expected_prompt_ids_for_all = set(EXPECTED_PROMPT_RANGES["all"])
+        missing_prompt_ids_report = sorted(
+            expected_prompt_ids_for_all - combined_present_prompt_ids
+        )
+        if missing_prompt_ids_report:
+            print(
+                "\nWarning: When '--category all' is specified, the combined files are missing the following prompt_ids "
+                "(continuing with partial aggregation):"
+            )
+            print(f"Missing IDs: {missing_prompt_ids_report}\n")
 
     # --- Step 2: Display individual file reports ---
     print("\n" + "="*50)
@@ -307,6 +310,12 @@ def main():
                 "0.4*CULTURE + 0.12*(TIME + SPACE + BIOLOGY + PHYSICS + CHEMISTRY)"
                 if args.category == "all"
                 else None
+            ),
+            "missing_prompt_ids": (
+                missing_prompt_ids_report if args.category == "all" else None
+            ),
+            "coverage_complete": (
+                len(missing_prompt_ids_report) == 0 if args.category == "all" else None
             ),
         },
     }
