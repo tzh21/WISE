@@ -6,23 +6,18 @@ Generate a single image from a text prompt with Qwen-Image (diffusers).
 - Without an input image path: loads Qwen-Image (text-to-image, ``DiffusionPipeline``).
 - With an image path: loads ``Qwen-Image-Edit-2511`` (same folder family as Qwen-Image) via
   ``QwenImageEditPlusPipeline``.
-- By default uses diffusers ``device_map="balanced"`` so each **pipeline component**
-  (e.g. text encoder, transformer, VAE) is spread across visible GPUs. This is **not**
-  tensor-parallel sharding inside one submodule; use ``CUDA_VISIBLE_DEVICES`` to choose devices.
-  Pass ``--no-balanced-multi-gpu`` to load the full pipeline on a single GPU (see ``--gpu``).
+- Uses single-GPU loading by default on ``cuda:0`` (or ``--gpu N``).
 
 Output::
     WISE/local/outputs/qwen_image/{MMDD-HHMMSS}/demo.png
 
 Example::
-    uv run python scripts/generate_qwen_single.py \"A red apple\" --ratio 16:9
-    uv run python scripts/generate_qwen_single.py \"Make it grayscale\" ./input.jpg
-
-    # Default: balanced placement on all visible CUDA devices
-    CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python scripts/generate_qwen_single.py \"...\"
+    uv run python scripts/generate_qwen_single.py "A red apple" --ratio 16:9
+    uv run python scripts/generate_qwen_single.py "Make it grayscale" ./input.jpg
 
     # Single-GPU (default cuda:0 if --gpu omitted)
-    uv run python scripts/generate_qwen_single.py \"...\" --no-balanced-multi-gpu --gpu 0
+    uv run python scripts/generate_qwen_single.py "..."
+    uv run python scripts/generate_qwen_single.py "..." --gpu 1
 
 Default checkpoints: env ``QWEN_IMAGE_HUB`` or ``/share/project/tzh/models/Qwen-Image``.
 Edit checkpoint: env ``QWEN_IMAGE_EDIT_HUB`` or ``{parent}/Qwen-Image-Edit-2511``.
@@ -107,21 +102,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--gpu",
         type=int,
-        default=None,
+        default=0,
         metavar="N",
-        help=(
-            "Single-GPU mode only: load the full pipeline on cuda:N. Implies --no-balanced-multi-gpu "
-            "over the default. With --no-balanced-multi-gpu and no --gpu, uses cuda:0."
-        ),
-    )
-    p.add_argument(
-        "--balanced-multi-gpu",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Default: True. Split pipeline components across visible CUDA devices via device_map=\"balanced\" "
-            "(needs accelerate). Use --no-balanced-multi-gpu for one full model on a single GPU."
-        ),
+        help="Single-GPU device id, used as cuda:N (default: 0).",
     )
     p.add_argument(
         "--ratio",
@@ -138,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--negative-prompt",
         default=" ",
-        help='Negative prompt (default: single space, as in upstream examples)',
+        help="Negative prompt (default: single space, as in upstream examples)",
     )
     p.add_argument(
         "--num-inference-steps",
@@ -180,15 +163,7 @@ def main() -> None:
     image_hub = resolve_image_hub(args.model_hub)
     edit_hub = resolve_edit_hub(args.edit_model_hub, image_hub)
 
-    if args.gpu is not None and args.balanced_multi_gpu:
-        print("[WARN] --gpu forces single-GPU load; ignoring --balanced-multi-gpu.")
-
-    if args.gpu is not None:
-        use_balanced = False
-        gpu_id = args.gpu
-    else:
-        use_balanced = bool(args.balanced_multi_gpu)
-        gpu_id = 0 if not use_balanced else None
+    gpu_id = int(args.gpu)
 
     import torch
     from diffusers import DiffusionPipeline, QwenImageEditPlusPipeline
@@ -197,15 +172,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for Qwen-Image generation.")
 
-    if use_balanced:
-        try:
-            import accelerate  # noqa: F401
-        except ImportError as e:
-            raise SystemExit(
-                "Balanced multi-GPU loading requires `accelerate` (install with `uv sync` or `pip install accelerate`). "
-                "Or use --no-balanced-multi-gpu for single-GPU mode."
-            ) from e
-    device = None if use_balanced else f"cuda:{int(gpu_id)}"
+    device = f"cuda:{gpu_id}"
     torch_dtype = torch.bfloat16
     width, height = ASPECT_RATIOS[args.ratio]
     full_prompt = args.prompt + _positive_suffix_for(args.positive_suffix, args.prompt)
@@ -215,16 +182,6 @@ def main() -> None:
     out_png = out_dir / "demo.png"
 
     def load_and_make_generator(pipe_cls: Any, hub_s: str) -> tuple[Any, torch.Generator]:
-        if use_balanced:
-            pipe = pipe_cls.from_pretrained(
-                hub_s,
-                torch_dtype=torch_dtype,
-                device_map="balanced",
-                low_cpu_mem_usage=True,
-            )
-            gen_dev = pipe._execution_device
-            gen = torch.Generator(device=torch.device(gen_dev)).manual_seed(args.seed % (2**32))
-            return pipe, gen
         pipe = pipe_cls.from_pretrained(hub_s, torch_dtype=torch_dtype)
         pipe = pipe.to(device)
         gen = torch.Generator(device=device).manual_seed(args.seed % (2**32))
@@ -233,13 +190,7 @@ def main() -> None:
     if args.image is None:
         hub_s = str(image_hub)
         print(f"[INFO] mode=text-to-image model_hub={hub_s}")
-        if use_balanced:
-            print(
-                f"[INFO] device_map=balanced CUDA devices={torch.cuda.device_count()} "
-                f"(respect CUDA_VISIBLE_DEVICES) ratio={args.ratio} ({width}x{height}) seed={args.seed}"
-            )
-        else:
-            print(f"[INFO] device={device} ratio={args.ratio} ({width}x{height}) seed={args.seed}")
+        print(f"[INFO] device={device} ratio={args.ratio} ({width}x{height}) seed={args.seed}")
         pipe, generator = load_and_make_generator(DiffusionPipeline, hub_s)
         image = pipe(
             prompt=full_prompt,
@@ -257,13 +208,7 @@ def main() -> None:
 
         hub_s = str(edit_hub)
         print(f"[INFO] mode=image-edit model_hub={hub_s}")
-        if use_balanced:
-            print(
-                f"[INFO] device_map=balanced CUDA devices={torch.cuda.device_count()} "
-                f"(respect CUDA_VISIBLE_DEVICES) input={in_path} ratio={args.ratio} ({width}x{height}) seed={args.seed}"
-            )
-        else:
-            print(f"[INFO] input={in_path} device={device} ratio={args.ratio} ({width}x{height}) seed={args.seed}")
+        print(f"[INFO] input={in_path} device={device} ratio={args.ratio} ({width}x{height}) seed={args.seed}")
         pil_in = Image.open(in_path).convert("RGB")
 
         pipe, generator = load_and_make_generator(QwenImageEditPlusPipeline, hub_s)
